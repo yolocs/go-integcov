@@ -11,13 +11,11 @@ import (
 	"time"
 
 	"github.com/sethvargo/go-envconfig"
-	"github.com/yolocs/go-integcov/integcov"
 	"golang.org/x/exp/slog"
 )
 
 type Config struct {
-	// TOOD: use a sane default value.
-	GoCoverDir string `env:"GOCOVERDIR"`
+	GoCoverDir string `env:"GOCOVERDIR,default=/tmp/integcov"`
 	Storage    string `env:"INTEGCOV_STORAGE"`
 }
 
@@ -49,21 +47,32 @@ func realMain(ctx context.Context) error {
 		return fmt.Errorf("failed to create GOCOVERDIR %q: %w", cfg.GoCoverDir, err)
 	}
 
-	storage, err := integcov.NewGoogleCloudStorage(ctx, cfg.Storage)
+	storage, err := NewGoogleCloudStorage(ctx, cfg.Storage)
 	if err != nil {
 		return fmt.Errorf("failed to create GCS: %w", err)
 	}
 
 	cmd := exec.CommandContext(ctx, entrypoint, remainingFlags...)
 	cmd.Env = append(cmd.Env, "GOCOVERDIR="+cfg.GoCoverDir)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Cancel = func() error {
+		// By default, Cancel will call cmd.Process.Kill, which would not trigger
+		// graceful shutdown of the actual program.
+		return cmd.Process.Signal(os.Interrupt)
+	}
 
 	if err := cmd.Run(); err != nil {
-		slog.Error("%q exited with error", err, entrypoint)
+		slog.Error("target exited with error", err, "entrypoint", entrypoint)
 		// We don't really care.
 	}
 
-	// Don't reuse the context since it could be "done" already.
-	uploadCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Don't reuse the context since it could be "done" already. It seems cloud
+	// run only has 10s max for graceful shutdown. That would be all the time we
+	// have to upload coverage files. But hopefully we only have a couple of files
+	// to write.
+	uploadCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := storage.Upload(uploadCtx, cfg.GoCoverDir); err != nil {
 		return fmt.Errorf("failed to upload coverage files: %w", err)
